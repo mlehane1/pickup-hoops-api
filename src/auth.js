@@ -54,7 +54,7 @@ router.post('/register', async (req, res) => {
     const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email.toLowerCase()]);
     if (existing.rows.length) return res.status(400).json({ error: 'Email already registered' });
 
-    let role = 'player';
+    let role = 'user';
     let inviteRecord = null;
 
     if (invite_token) {
@@ -67,13 +67,11 @@ router.post('/register', async (req, res) => {
       role = inviteRecord.role;
     }
 
-    // Check if this is the very first user — make them master admin
     const userCount = await pool.query('SELECT COUNT(*) FROM users');
     if (parseInt(userCount.rows[0].count) === 0) role = 'master_admin';
 
     const password_hash = await bcrypt.hash(password, 12);
     const id = `u${Date.now()}`;
-
     const verifyToken = require('crypto').randomBytes(32).toString('hex');
 
     await pool.query(
@@ -82,13 +80,20 @@ router.post('/register', async (req, res) => {
       [id, name, email.toLowerCase(), password_hash, role]
     );
 
-    await sendVerification(email, name, verifyToken, id);
-
     if (inviteRecord) {
       await pool.query('UPDATE invite_tokens SET used = true WHERE id = $1', [inviteRecord.id]);
     }
 
-    res.status(201).json({ message: 'Account created. Please check your email to verify your account.' });
+    // Respond immediately — email fires in background and never blocks
+    const token = jwt.sign({ userId: id }, JWT_SECRET, { expiresIn: '7d' });
+    res.status(201).json({
+      token,
+      user: { id, name, email: email.toLowerCase(), role, mfa_enabled: false, is_verified: false }
+    });
+
+    // Send verification email after response — errors are swallowed intentionally
+    try { await sendVerification(email, name, verifyToken, id); } catch (_) {}
+
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -97,15 +102,14 @@ router.post('/register', async (req, res) => {
 // ─── VERIFY EMAIL ─────────────────────────────────────────────────────────────
 router.get('/verify/:userId/:token', async (req, res) => {
   try {
-    const { userId, token } = req.params;
+    const { userId } = req.params;
     const result = await pool.query('SELECT * FROM users WHERE id = $1', [userId]);
     if (!result.rows.length) return res.status(400).send('Invalid verification link');
-
     await pool.query('UPDATE users SET is_verified = true WHERE id = $1', [userId]);
     res.send(`
-      <html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#0B0C0E;color:#E8E9EE">
-        <h1 style="color:#F97316">Email Verified</h1>
-        <p>Your account is now active. You can close this tab and log in.</p>
+      <html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#F5F5F4;color:#111827">
+        <h1 style="color:#EA6B0A">Email Verified</h1>
+        <p>Your account is now verified. You can close this tab.</p>
       </body></html>
     `);
   } catch (err) {
@@ -124,8 +128,6 @@ router.post('/login', async (req, res) => {
     const valid = await bcrypt.compare(password, user.password_hash);
     if (!valid) return res.status(401).json({ error: 'Invalid email or password' });
 
-    if (!user.is_verified) return res.status(401).json({ error: 'Please verify your email before logging in' });
-
     if (user.mfa_enabled) {
       const tempToken = jwt.sign({ userId: user.id, mfa_pending: true }, JWT_SECRET, { expiresIn: '10m' });
       return res.json({ mfa_required: true, temp_token: tempToken });
@@ -134,14 +136,14 @@ router.post('/login', async (req, res) => {
     const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '7d' });
     res.json({
       token,
-      user: { id: user.id, name: user.name, email: user.email, role: user.role, mfa_enabled: user.mfa_enabled }
+      user: { id: user.id, name: user.name, email: user.email, role: user.role, mfa_enabled: user.mfa_enabled, is_verified: user.is_verified }
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ─── MFA VERIFY ───────────────────────────────────────────────────────────────
+// ─── MFA ──────────────────────────────────────────────────────────────────────
 router.post('/mfa/verify', async (req, res) => {
   const { temp_token, code } = req.body;
   try {
@@ -163,14 +165,13 @@ router.post('/mfa/verify', async (req, res) => {
     const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '7d' });
     res.json({
       token,
-      user: { id: user.id, name: user.name, email: user.email, role: user.role, mfa_enabled: user.mfa_enabled }
+      user: { id: user.id, name: user.name, email: user.email, role: user.role, mfa_enabled: user.mfa_enabled, is_verified: user.is_verified }
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ─── MFA SETUP ────────────────────────────────────────────────────────────────
 router.post('/mfa/setup', authenticate, async (req, res) => {
   try {
     const secret = speakeasy.generateSecret({ name: `PickupHoops (${req.user.email})` });
@@ -217,15 +218,16 @@ router.post('/forgot-password', async (req, res) => {
 
     const user = result.rows[0];
     const token = require('crypto').randomBytes(32).toString('hex');
-    const expires = new Date(Date.now() + 3600000); // 1 hour
+    const expires = new Date(Date.now() + 3600000);
 
     await pool.query(
       'INSERT INTO password_reset_tokens (user_id, token, expires_at) VALUES ($1, $2, $3)',
       [user.id, token, expires]
     );
 
-    await sendPasswordReset(user.email, user.name, token);
     res.json({ message: 'If that email exists you will receive a reset link' });
+    try { await sendPasswordReset(user.email, user.name, token); } catch (_) {}
+
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -253,28 +255,31 @@ router.post('/reset-password', async (req, res) => {
 });
 
 // ─── INVITE ───────────────────────────────────────────────────────────────────
-router.post('/invite', authenticate, requireAdmin, async (req, res) => {
+router.post('/invite', authenticate, async (req, res) => {
   const { email, role } = req.body;
   try {
     const token = require('crypto').randomBytes(32).toString('hex');
-    const expires = new Date(Date.now() + 7 * 24 * 3600000); // 7 days
+    const expires = new Date(Date.now() + 7 * 24 * 3600000);
 
     await pool.query(
       'INSERT INTO invite_tokens (email, token, role, created_by, expires_at) VALUES ($1, $2, $3, $4, $5)',
-      [email.toLowerCase(), token, role || 'player', req.user.id, expires]
+      [email.toLowerCase(), token, role || 'user', req.user.id, expires]
     );
 
-    await sendInvite(email, req.user.name, token, role || 'player');
     res.json({ message: 'Invite sent' });
+    try { await sendInvite(email, req.user.name, token, role || 'user'); } catch (_) {}
+
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ─── ADMIN: MANAGE USERS ──────────────────────────────────────────────────────
-router.get('/users', authenticate, requireAdmin, async (req, res) => {
+// ─── USER MANAGEMENT ──────────────────────────────────────────────────────────
+router.get('/users', authenticate, requireMasterAdmin, async (req, res) => {
   try {
-    const result = await pool.query('SELECT id, name, email, role, is_verified, mfa_enabled, created_at FROM users ORDER BY created_at DESC');
+    const result = await pool.query(
+      'SELECT id, name, email, role, is_verified, mfa_enabled, created_at FROM users ORDER BY created_at DESC'
+    );
     res.json(result.rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -307,6 +312,7 @@ router.get('/me', authenticate, async (req, res) => {
     email: req.user.email,
     role: req.user.role,
     mfa_enabled: req.user.mfa_enabled,
+    is_verified: req.user.is_verified,
   });
 });
 

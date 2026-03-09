@@ -7,7 +7,7 @@ const createTables = async () => {
       name VARCHAR(100) NOT NULL,
       email VARCHAR(255) UNIQUE NOT NULL,
       password_hash VARCHAR(255),
-      role VARCHAR(20) NOT NULL DEFAULT 'player',
+      role VARCHAR(20) NOT NULL DEFAULT 'user',
       mfa_enabled BOOLEAN DEFAULT false,
       mfa_secret VARCHAR(255),
       is_verified BOOLEAN DEFAULT false,
@@ -18,7 +18,7 @@ const createTables = async () => {
       id SERIAL PRIMARY KEY,
       email VARCHAR(255) NOT NULL,
       token VARCHAR(255) UNIQUE NOT NULL,
-      role VARCHAR(20) DEFAULT 'player',
+      role VARCHAR(20) DEFAULT 'user',
       created_by VARCHAR(50) REFERENCES users(id),
       used BOOLEAN DEFAULT false,
       expires_at TIMESTAMP NOT NULL,
@@ -36,7 +36,7 @@ const createTables = async () => {
 
     CREATE TABLE IF NOT EXISTS games (
       id VARCHAR(50) PRIMARY KEY,
-      admin_id VARCHAR(50) REFERENCES users(id),
+      owner_id VARCHAR(50) REFERENCES users(id),
       title VARCHAR(100) NOT NULL,
       location VARCHAR(200) NOT NULL,
       date DATE NOT NULL,
@@ -48,6 +48,12 @@ const createTables = async () => {
       track_stats BOOLEAN DEFAULT false,
       status VARCHAR(20) DEFAULT 'upcoming',
       created_at TIMESTAMP DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS game_managers (
+      game_id VARCHAR(50) REFERENCES games(id) ON DELETE CASCADE,
+      user_id VARCHAR(50) REFERENCES users(id),
+      PRIMARY KEY (game_id, user_id)
     );
 
     CREATE TABLE IF NOT EXISTS game_invites (
@@ -82,6 +88,19 @@ const createTables = async () => {
       stl INTEGER DEFAULT 0,
       blk INTEGER DEFAULT 0,
       UNIQUE(game_id, user_id, date)
+    );
+
+    CREATE TABLE IF NOT EXISTS game_scores (
+      id SERIAL PRIMARY KEY,
+      game_id VARCHAR(50) REFERENCES games(id) ON DELETE CASCADE,
+      date DATE NOT NULL,
+      team1_name VARCHAR(100) NOT NULL DEFAULT 'Team 1',
+      team2_name VARCHAR(100) NOT NULL DEFAULT 'Team 2',
+      team1_score INTEGER DEFAULT 0,
+      team2_score INTEGER DEFAULT 0,
+      is_final BOOLEAN DEFAULT false,
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
     );
   `);
 

@@ -3,12 +3,29 @@ const router = express.Router();
 const pool = require('./db');
 const { authenticate } = require('./auth');
 
+// ─── HELPERS ──────────────────────────────────────────────────────────────────
+
+const enrichGame = async (game) => {
+  const [invites, signups, managers] = await Promise.all([
+    pool.query('SELECT user_id FROM game_invites WHERE game_id = $1', [game.id]),
+    pool.query('SELECT user_id FROM game_signups WHERE game_id = $1', [game.id]),
+    pool.query('SELECT user_id FROM game_managers WHERE game_id = $1', [game.id]),
+  ]);
+  game.invited_ids = invites.rows.map(r => r.user_id);
+  game.signup_ids = signups.rows.map(r => r.user_id);
+  game.manager_ids = managers.rows.map(r => r.user_id);
+  return game;
+};
+
+const canManage = (game, userId) =>
+  game.owner_id === userId || game.manager_ids?.includes(userId);
+
 // ─── USERS ────────────────────────────────────────────────────────────────────
 
 router.get('/users', authenticate, async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT id, name, email, role FROM users ORDER BY role, name'
+      'SELECT id, name, email, role FROM users ORDER BY name'
     );
     res.json(result.rows);
   } catch (err) {
@@ -21,19 +38,8 @@ router.get('/users', authenticate, async (req, res) => {
 router.get('/games', authenticate, async (req, res) => {
   try {
     const games = await pool.query('SELECT * FROM games ORDER BY date ASC');
-
-    for (let game of games.rows) {
-      const invites = await pool.query(
-        'SELECT user_id FROM game_invites WHERE game_id = $1', [game.id]
-      );
-      const signups = await pool.query(
-        'SELECT user_id FROM game_signups WHERE game_id = $1', [game.id]
-      );
-      game.invited_ids = invites.rows.map(r => r.user_id);
-      game.signup_ids = signups.rows.map(r => r.user_id);
-    }
-
-    res.json(games.rows);
+    const enriched = await Promise.all(games.rows.map(enrichGame));
+    res.json(enriched);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -44,23 +50,12 @@ router.get('/games/:id', authenticate, async (req, res) => {
     const result = await pool.query('SELECT * FROM games WHERE id = $1', [req.params.id]);
     if (!result.rows.length) return res.status(404).json({ error: 'Game not found' });
 
-    const game = result.rows[0];
+    const game = await enrichGame(result.rows[0]);
 
-    const invites = await pool.query(
-      'SELECT user_id FROM game_invites WHERE game_id = $1', [game.id]
-    );
-    const signups = await pool.query(
-      'SELECT user_id FROM game_signups WHERE game_id = $1', [game.id]
-    );
-    const attendance = await pool.query(
-      'SELECT user_id, date FROM attendance WHERE game_id = $1', [game.id]
-    );
-    const stats = await pool.query(
-      'SELECT user_id, date, pts, reb, ast, stl, blk FROM stats WHERE game_id = $1', [game.id]
-    );
-
-    game.invited_ids = invites.rows.map(r => r.user_id);
-    game.signup_ids = signups.rows.map(r => r.user_id);
+    const [attendance, stats] = await Promise.all([
+      pool.query('SELECT user_id, date FROM attendance WHERE game_id = $1', [game.id]),
+      pool.query('SELECT user_id, date, pts, reb, ast, stl, blk FROM stats WHERE game_id = $1', [game.id]),
+    ]);
 
     game.attendance = {};
     attendance.rows.forEach(r => {
@@ -85,12 +80,12 @@ router.get('/games/:id', authenticate, async (req, res) => {
 });
 
 router.post('/games', authenticate, async (req, res) => {
-  const { id, admin_id, title, location, date, time, max_spots, is_recurring, recurrence, is_public, track_stats, invited_ids } = req.body;
+  const { id, title, location, date, time, max_spots, is_recurring, recurrence, is_public, track_stats, invited_ids } = req.body;
   try {
     await pool.query(
-      `INSERT INTO games (id, admin_id, title, location, date, time, max_spots, is_recurring, recurrence, is_public, track_stats)
+      `INSERT INTO games (id, owner_id, title, location, date, time, max_spots, is_recurring, recurrence, is_public, track_stats)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-      [id, admin_id, title, location, date, time, max_spots, is_recurring, recurrence, is_public, track_stats]
+      [id, req.user.id, title, location, date, time, max_spots, is_recurring, recurrence, is_public, track_stats]
     );
 
     if (invited_ids?.length) {
@@ -103,15 +98,24 @@ router.post('/games', authenticate, async (req, res) => {
     }
 
     const game = await pool.query('SELECT * FROM games WHERE id = $1', [id]);
-    res.status(201).json(game.rows[0]);
+    res.status(201).json(await enrichGame(game.rows[0]));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
 router.put('/games/:id', authenticate, async (req, res) => {
-  const { title, location, date, time, max_spots, is_recurring, recurrence, is_public, track_stats, status, invited_ids } = req.body;
   try {
+    const result = await pool.query('SELECT * FROM games WHERE id = $1', [req.params.id]);
+    if (!result.rows.length) return res.status(404).json({ error: 'Game not found' });
+    const game = await enrichGame(result.rows[0]);
+
+    if (!canManage(game, req.user.id) && req.user.role !== 'master_admin') {
+      return res.status(403).json({ error: 'Not authorized' });
+    }
+
+    const { title, location, date, time, max_spots, is_recurring, recurrence, is_public, track_stats, status, invited_ids, manager_ids } = req.body;
+
     await pool.query(
       `UPDATE games SET title=$1, location=$2, date=$3, time=$4, max_spots=$5,
        is_recurring=$6, recurrence=$7, is_public=$8, track_stats=$9, status=$10
@@ -129,8 +133,21 @@ router.put('/games/:id', authenticate, async (req, res) => {
       }
     }
 
-    const game = await pool.query('SELECT * FROM games WHERE id = $1', [req.params.id]);
-    res.json(game.rows[0]);
+    // Only owner can change managers
+    if (game.owner_id === req.user.id) {
+      await pool.query('DELETE FROM game_managers WHERE game_id = $1', [req.params.id]);
+      if (manager_ids?.length) {
+        for (const uid of manager_ids) {
+          await pool.query(
+            'INSERT INTO game_managers (game_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+            [req.params.id, uid]
+          );
+        }
+      }
+    }
+
+    const updated = await pool.query('SELECT * FROM games WHERE id = $1', [req.params.id]);
+    res.json(await enrichGame(updated.rows[0]));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -138,6 +155,14 @@ router.put('/games/:id', authenticate, async (req, res) => {
 
 router.delete('/games/:id', authenticate, async (req, res) => {
   try {
+    const result = await pool.query('SELECT * FROM games WHERE id = $1', [req.params.id]);
+    if (!result.rows.length) return res.status(404).json({ error: 'Game not found' });
+    const game = result.rows[0];
+
+    if (game.owner_id !== req.user.id && req.user.role !== 'master_admin') {
+      return res.status(403).json({ error: 'Only the game owner can delete this game' });
+    }
+
     await pool.query('DELETE FROM games WHERE id = $1', [req.params.id]);
     res.json({ success: true });
   } catch (err) {
@@ -174,12 +199,17 @@ router.delete('/games/:id/signup', authenticate, async (req, res) => {
 // ─── ATTENDANCE ───────────────────────────────────────────────────────────────
 
 router.post('/games/:id/attendance', authenticate, async (req, res) => {
-  const { date, user_ids } = req.body;
   try {
-    await pool.query(
-      'DELETE FROM attendance WHERE game_id = $1 AND date = $2',
-      [req.params.id, date]
-    );
+    const result = await pool.query('SELECT * FROM games WHERE id = $1', [req.params.id]);
+    if (!result.rows.length) return res.status(404).json({ error: 'Game not found' });
+    const game = await enrichGame(result.rows[0]);
+
+    if (!canManage(game, req.user.id) && req.user.role !== 'master_admin') {
+      return res.status(403).json({ error: 'Not authorized' });
+    }
+
+    const { date, user_ids } = req.body;
+    await pool.query('DELETE FROM attendance WHERE game_id = $1 AND date = $2', [req.params.id, date]);
     for (const uid of user_ids) {
       await pool.query(
         'INSERT INTO attendance (game_id, user_id, date) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
@@ -195,8 +225,16 @@ router.post('/games/:id/attendance', authenticate, async (req, res) => {
 // ─── STATS ────────────────────────────────────────────────────────────────────
 
 router.post('/games/:id/stats', authenticate, async (req, res) => {
-  const { date, stats } = req.body;
   try {
+    const result = await pool.query('SELECT * FROM games WHERE id = $1', [req.params.id]);
+    if (!result.rows.length) return res.status(404).json({ error: 'Game not found' });
+    const game = await enrichGame(result.rows[0]);
+
+    if (!canManage(game, req.user.id) && req.user.role !== 'master_admin') {
+      return res.status(403).json({ error: 'Not authorized' });
+    }
+
+    const { date, stats } = req.body;
     for (const [uid, s] of Object.entries(stats)) {
       await pool.query(
         `INSERT INTO stats (game_id, user_id, date, pts, reb, ast, stl, blk)
@@ -212,4 +250,63 @@ router.post('/games/:id/stats', authenticate, async (req, res) => {
   }
 });
 
+// ─── SCORES ───────────────────────────────────────────────────────────────────
+
+router.get('/games/:id/scores', authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM game_scores WHERE game_id = $1 ORDER BY date DESC, id DESC',
+      [req.params.id]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/games/:id/scores', authenticate, async (req, res) => {
+  try {
+    const game = await pool.query('SELECT * FROM games WHERE id = $1', [req.params.id]);
+    if (!game.rows.length) return res.status(404).json({ error: 'Game not found' });
+    const enriched = await enrichGame(game.rows[0]);
+    if (!canManage(enriched, req.user.id) && req.user.role !== 'master_admin') {
+      return res.status(403).json({ error: 'Not authorized' });
+    }
+    const { date, team1_name, team2_name } = req.body;
+    const result = await pool.query(
+      `INSERT INTO game_scores (game_id, date, team1_name, team2_name)
+       VALUES ($1, $2, $3, $4) RETURNING *`,
+      [req.params.id, date, team1_name || 'Team 1', team2_name || 'Team 2']
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.put('/games/:id/scores/:scoreId', authenticate, async (req, res) => {
+  try {
+    const { team1_score, team2_score, team1_name, team2_name, is_final } = req.body;
+    const result = await pool.query(
+      `UPDATE game_scores
+       SET team1_score = $1, team2_score = $2, team1_name = $3,
+           team2_name = $4, is_final = $5, updated_at = NOW()
+       WHERE id = $6 AND game_id = $7 RETURNING *`,
+      [team1_score, team2_score, team1_name, team2_name, is_final, req.params.scoreId, req.params.id]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: 'Score not found' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.delete('/games/:id/scores/:scoreId', authenticate, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM game_scores WHERE id = $1 AND game_id = $2', [req.params.scoreId, req.params.id]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 module.exports = router;
