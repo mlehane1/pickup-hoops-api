@@ -3,14 +3,11 @@ require('dotenv').config();
 
 const migrate = async () => {
   try {
-    await pool.query(`
-      ALTER TABLE users
-        ADD COLUMN IF NOT EXISTS email VARCHAR(255),
-        ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255),
-        ADD COLUMN IF NOT EXISTS mfa_enabled BOOLEAN DEFAULT false,
-        ADD COLUMN IF NOT EXISTS mfa_secret VARCHAR(255),
-        ADD COLUMN IF NOT EXISTS is_verified BOOLEAN DEFAULT false;
-    `);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(255)`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255)`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS mfa_enabled BOOLEAN DEFAULT false`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS mfa_secret VARCHAR(255)`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_verified BOOLEAN DEFAULT false`);
 
     await pool.query(`DELETE FROM game_signups`);
     await pool.query(`DELETE FROM game_invites`);
@@ -18,6 +15,9 @@ const migrate = async () => {
     await pool.query(`DELETE FROM stats`);
     await pool.query(`DELETE FROM games`);
     await pool.query(`DELETE FROM users`);
+
+    await pool.query(`ALTER TABLE users ALTER COLUMN email SET NOT NULL`);
+    await pool.query(`ALTER TABLE users ADD CONSTRAINT users_email_unique UNIQUE (email)`);
 
     console.log('Migration complete');
     process.exit(0);
